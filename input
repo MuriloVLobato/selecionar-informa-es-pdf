@@ -1,1 +1,112 @@
+import os
+import PyPDF2
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import openai
+from flask import Flask, request, jsonify
 
+# Configurações
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Modelo de embedding leve e eficiente
+DIMENSION = 384  # Dimensão dos embeddings gerados pelo modelo
+openai.api_key = "SUA_API_KEY_OPENAI"  # Substitua pela sua chave da API OpenAI
+
+# Função para extrair texto de um PDF
+def extract_text_from_pdf(file_path):
+    with open(file_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text()
+        return text
+
+# Função para dividir o texto em blocos menores (chunks)
+def split_text_into_chunks(text, max_length=500):
+    words = text.split()
+    chunks = []
+    current_chunk = ""
+    for word in words:
+        if len(current_chunk) + len(word) < max_length:
+            current_chunk += word + " "
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = word + " "
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+# Função para criar embeddings
+def create_embeddings(chunks):
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    embeddings = model.encode(chunks)
+    return embeddings
+
+# Função para indexar embeddings usando FAISS
+def index_embeddings(embeddings):
+    index = faiss.IndexFlatL2(DIMENSION)
+    index.add(np.array(embeddings))
+    return index
+
+# Função para buscar trechos relevantes
+def search_relevant_chunks(query, index, chunks, top_k=3):
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    query_embedding = model.encode([query])
+    distances, indices = index.search(np.array(query_embedding), top_k)
+    relevant_chunks = [chunks[i] for i in indices[0]]
+    return relevant_chunks
+
+# Função para gerar resposta usando OpenAI
+def generate_response(prompt):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Você é um assistente que responde perguntas com base no contexto fornecido."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.choices[0].message["content"]
+
+# Pipeline principal
+class PDFChat:
+    def __init__(self):
+        self.chunks = []
+        self.embeddings = None
+        self.index = None
+
+    def load_pdfs(self, pdf_paths):
+        all_text = ""
+        for pdf_path in pdf_paths:
+            all_text += extract_text_from_pdf(pdf_path) + "\n"
+        self.chunks = split_text_into_chunks(all_text)
+        self.embeddings = create_embeddings(self.chunks)
+        self.index = index_embeddings(self.embeddings)
+
+    def ask_question(self, question):
+        relevant_chunks = search_relevant_chunks(question, self.index, self.chunks)
+        context = "\n".join(relevant_chunks)
+        prompt = f"Pergunta: {question}\nContexto:\n{context}\nResposta:"
+        response = generate_response(prompt)
+        return response
+
+# API Flask para o chat interativo
+app = Flask(__name__)
+pdf_chat = PDFChat()
+
+@app.route('/load', methods=['POST'])
+def load_pdfs():
+    pdf_paths = request.json.get('pdf_paths')
+    if not pdf_paths:
+        return jsonify({"error": "Lista de caminhos de PDFs não fornecida"}), 400
+    pdf_chat.load_pdfs(pdf_paths)
+    return jsonify({"message": "PDFs carregados com sucesso!"})
+
+@app.route('/ask', methods=['POST'])
+def ask_question():
+    question = request.json.get('question')
+    if not question:
+        return jsonify({"error": "Pergunta não fornecida"}), 400
+    response = pdf_chat.ask_question(question)
+    return jsonify({"response": response})
+
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)
